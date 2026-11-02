@@ -1,0 +1,1 @@
+"""Gemini Store Telegram bot."""
