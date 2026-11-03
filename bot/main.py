@@ -12,6 +12,7 @@ from bot.config import Settings
 from bot.db import Database
 from bot.handlers.admin import router as admin_router
 from bot.handlers.user import router as user_router
+from bot.membership import MembershipGateMiddleware
 
 
 async def main_async() -> None:
@@ -27,6 +28,8 @@ async def main_async() -> None:
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
     dispatcher = Dispatcher()
+    user_router.message.outer_middleware(MembershipGateMiddleware())
+    user_router.callback_query.outer_middleware(MembershipGateMiddleware())
     dispatcher.include_router(user_router)
     dispatcher.include_router(admin_router)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import calendar
 import json
+import re
 import secrets
 import uuid
 from datetime import datetime, timezone
@@ -32,6 +33,19 @@ def add_months(value: datetime, months: int) -> datetime:
     return value.replace(year=year, month=month, day=day)
 
 
+def coupon_discount_amount(
+    price: Decimal, coupon: asyncpg.Record, currency: str
+) -> Decimal:
+    if coupon["discount_type"] == "fixed":
+        if coupon["currency"] != currency:
+            raise StoreError("coupon_currency_mismatch")
+        raw_discount = Decimal(coupon["discount_value"])
+    else:
+        raw_discount = price * Decimal(coupon["discount_value"]) / Decimal("100")
+    quantum = Decimal("1") if currency == "DZD" else Decimal("0.01")
+    return min(price, raw_discount.quantize(quantum, rounding=ROUND_HALF_UP))
+
+
 class Database:
     def __init__(self, pool: asyncpg.Pool):
         self.pool = pool
@@ -60,19 +74,36 @@ class Database:
                 "Gemini Store database tables are missing. Run `python -m bot.migrate` once before starting the bot."
             )
 
-    async def register_user(self, telegram_id: int, username: str | None, first_name: str) -> tuple[str, bool]:
+    async def register_user(
+        self,
+        telegram_id: int,
+        username: str | None,
+        first_name: str,
+        referrer_id: int | None = None,
+    ) -> tuple[str, bool]:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
+                valid_referrer = None
+                if (
+                    referrer_id is not None
+                    and referrer_id != telegram_id
+                    and 0 < referrer_id <= 9_223_372_036_854_775_807
+                ):
+                    valid_referrer = await conn.fetchval(
+                        "SELECT telegram_id FROM store_users WHERE telegram_id = $1",
+                        referrer_id,
+                    )
                 created_id = await conn.fetchval(
                     """
-                    INSERT INTO store_users (telegram_id, username, first_name)
-                    VALUES ($1, $2, $3)
+                    INSERT INTO store_users (telegram_id, username, first_name, referred_by)
+                    VALUES ($1, $2, $3, $4)
                     ON CONFLICT (telegram_id) DO NOTHING
                     RETURNING telegram_id
                     """,
                     telegram_id,
                     username,
                     first_name,
+                    valid_referrer,
                 )
                 if created_id is None:
                     await conn.execute(
@@ -112,6 +143,25 @@ class Database:
         async with self.pool.acquire() as conn:
             return await conn.fetchrow("SELECT * FROM store_users WHERE telegram_id = $1", telegram_id)
 
+    async def find_user_by_username(self, username: str) -> asyncpg.Record | None:
+        normalized = username.strip().removeprefix("@").lower()
+        if not normalized or len(normalized) > 64:
+            return None
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT telegram_id, username, first_name, language
+                FROM store_users
+                WHERE LOWER(username) = $1
+                ORDER BY updated_at DESC
+                LIMIT 2
+                """,
+                normalized,
+            )
+        if len(rows) > 1:
+            raise StoreError("ambiguous_recipient")
+        return rows[0] if rows else None
+
     async def set_language(self, telegram_id: int, language: str) -> None:
         if language not in {"ar", "en"}:
             raise StoreError("Unsupported language.")
@@ -126,6 +176,180 @@ class Database:
         async with self.pool.acquire() as conn:
             rows = await conn.fetch("SELECT currency, balance FROM wallets WHERE user_id = $1", telegram_id)
         return {row["currency"]: money(row["balance"]) for row in rows}
+
+    async def referral_summary(self, telegram_id: int) -> asyncpg.Record:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM store_users WHERE referred_by = $1) AS referrals,
+                    (SELECT COUNT(*) FROM referral_rewards WHERE referrer_id = $1) AS rewarded_referrals,
+                    COALESCE(
+                        (SELECT SUM(amount) FROM referral_rewards WHERE referrer_id = $1),
+                        0
+                    ) AS earned_dzd
+                """,
+                telegram_id,
+            )
+
+    async def referral_reward_for_order(self, order_id: int) -> asyncpg.Record | None:
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(
+                """
+                SELECT referrer_id, referred_user_id, order_id, amount
+                FROM referral_rewards WHERE order_id = $1
+                """,
+                order_id,
+            )
+
+    async def create_gift_draft(
+        self, sender_id: int, receiver_id: int, amount: Decimal
+    ) -> asyncpg.Record:
+        value = money(amount)
+        if (
+            sender_id == receiver_id
+            or value < 150
+            or value != value.quantize(Decimal("1"))
+        ):
+            raise StoreError("invalid_gift")
+        gift_id = uuid.uuid4()
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                recipient = await conn.fetchrow(
+                    "SELECT telegram_id FROM store_users WHERE telegram_id = $1",
+                    receiver_id,
+                )
+                sender = await conn.fetchval(
+                    "SELECT telegram_id FROM store_users WHERE telegram_id = $1",
+                    sender_id,
+                )
+                if not recipient or not sender:
+                    raise StoreError("gift_recipient_unregistered")
+                return await conn.fetchrow(
+                    """
+                    INSERT INTO gift_drafts (id, sender_id, receiver_id, amount)
+                    VALUES ($1, $2, $3, $4)
+                    RETURNING *
+                    """,
+                    gift_id,
+                    sender_id,
+                    receiver_id,
+                    value,
+                )
+
+    async def cancel_gift_draft(self, draft_id: uuid.UUID, sender_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE gift_drafts SET status = 'cancelled'
+                WHERE id = $1 AND sender_id = $2 AND status = 'open'
+                """,
+                draft_id,
+                sender_id,
+            )
+        return result.endswith("1")
+
+    async def confirm_gift(
+        self, draft_id: uuid.UUID, sender_id: int
+    ) -> tuple[str, asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                draft = await conn.fetchrow(
+                    "SELECT * FROM gift_drafts WHERE id = $1 AND sender_id = $2 FOR UPDATE",
+                    draft_id,
+                    sender_id,
+                )
+                if not draft:
+                    raise StoreError("gift_draft_not_found")
+                if draft["status"] == "completed":
+                    transfer = await conn.fetchrow(
+                        "SELECT * FROM gift_transfers WHERE draft_id = $1",
+                        draft_id,
+                    )
+                    if transfer:
+                        return "duplicate", transfer
+                    raise StoreError("gift_transfer_missing")
+                if draft["status"] != "open":
+                    raise StoreError("gift_draft_closed")
+                wallets = await conn.fetch(
+                    """
+                    SELECT user_id, balance FROM wallets
+                    WHERE user_id = ANY($1::bigint[]) AND currency = 'DZD'
+                    ORDER BY user_id FOR UPDATE
+                    """,
+                    sorted([sender_id, draft["receiver_id"]]),
+                )
+                balances = {row["user_id"]: money(row["balance"]) for row in wallets}
+                sender_balance = balances.get(sender_id, Decimal("0"))
+                amount = money(draft["amount"])
+                if sender_balance < amount:
+                    return "insufficient", {
+                        "shortage": money(amount - sender_balance),
+                        "balance": sender_balance,
+                    }
+                gift_code = code("GFT")
+                transfer = await conn.fetchrow(
+                    """
+                    INSERT INTO gift_transfers
+                        (gift_code, idempotency_key, draft_id, sender_id, receiver_id, amount)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    RETURNING *
+                    """,
+                    gift_code,
+                    draft_id,
+                    draft_id,
+                    sender_id,
+                    draft["receiver_id"],
+                    amount,
+                )
+                await conn.execute(
+                    """
+                    UPDATE wallets SET balance = balance - $2, updated_at = NOW()
+                    WHERE user_id = $1 AND currency = 'DZD'
+                    """,
+                    sender_id,
+                    amount,
+                )
+                await conn.execute(
+                    """
+                    UPDATE wallets SET balance = balance + $2, updated_at = NOW()
+                    WHERE user_id = $1 AND currency = 'DZD'
+                    """,
+                    draft["receiver_id"],
+                    amount,
+                )
+                for user_id, transaction_type, signed_amount in (
+                    (sender_id, "gift_sent", -amount),
+                    (draft["receiver_id"], "gift_received", amount),
+                ):
+                    await conn.execute(
+                        """
+                        INSERT INTO wallet_ledger
+                            (user_id, currency, amount, transaction_type, reference, details)
+                        VALUES ($1, 'DZD', $2, $3, $4, $5::jsonb)
+                        """,
+                        user_id,
+                        signed_amount,
+                        transaction_type,
+                        gift_code,
+                        json.dumps(
+                            {
+                                "gift_code": gift_code,
+                                "sender_id": sender_id,
+                                "receiver_id": draft["receiver_id"],
+                            }
+                        ),
+                    )
+                await conn.execute(
+                    """
+                    UPDATE gift_drafts
+                    SET status = 'completed', gift_code = $2, completed_at = NOW()
+                    WHERE id = $1
+                    """,
+                    draft_id,
+                    gift_code,
+                )
+                return "created", transfer
 
     async def list_products(self, active_only: bool = True) -> list[asyncpg.Record]:
         async with self.pool.acquire() as conn:
@@ -202,6 +426,168 @@ class Database:
                     conn, admin_id, "set_product_price", "product_price",
                     f"{product_id}:{duration_months}:{currency}", {"amount": str(value)},
                 )
+
+    async def create_coupon(
+        self,
+        coupon_code: str,
+        discount_type: str,
+        discount_value: Decimal,
+        currency: str | None,
+        max_uses: int,
+        expires_at: datetime,
+        admin_id: int,
+    ) -> asyncpg.Record | None:
+        normalized_code = coupon_code.strip().upper()
+        value = money(discount_value)
+        if (
+            not re.fullmatch(r"[A-Z0-9_-]{3,32}", normalized_code)
+            or discount_type not in {"fixed", "percent"}
+            or value <= 0
+            or max_uses < 1
+            or max_uses > 1_000_000
+            or expires_at.tzinfo is None
+            or expires_at <= datetime.now(timezone.utc)
+        ):
+            raise StoreError("invalid_coupon")
+        if discount_type == "percent":
+            if currency is not None or value > 100:
+                raise StoreError("invalid_coupon")
+        elif (
+            currency not in {"DZD", "USD"}
+            or (currency == "DZD" and value != value.quantize(Decimal("1")))
+        ):
+            raise StoreError("invalid_coupon")
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                coupon = await conn.fetchrow(
+                    """
+                    INSERT INTO coupons
+                        (code, discount_type, discount_value, currency, max_uses, expires_at, created_by)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    ON CONFLICT (code) DO NOTHING
+                    RETURNING *
+                    """,
+                    normalized_code,
+                    discount_type,
+                    value,
+                    currency,
+                    max_uses,
+                    expires_at,
+                    admin_id,
+                )
+                if coupon:
+                    await self._audit(
+                        conn, admin_id, "create_coupon", "coupon", coupon["id"],
+                        {
+                            "code": normalized_code,
+                            "discount_type": discount_type,
+                            "discount_value": str(value),
+                            "currency": currency,
+                            "max_uses": max_uses,
+                            "expires_at": expires_at.isoformat(),
+                        },
+                    )
+                return coupon
+
+    async def admin_coupons(self, limit: int = 30) -> list[asyncpg.Record]:
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(
+                """
+                SELECT c.*,
+                       COUNT(r.id)::INTEGER AS used_count,
+                       GREATEST(c.max_uses - COUNT(r.id)::INTEGER, 0) AS remaining
+                FROM coupons c
+                LEFT JOIN coupon_redemptions r ON r.coupon_id = c.id
+                GROUP BY c.id
+                ORDER BY c.created_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+
+    async def toggle_coupon(self, coupon_id: int, active: bool, admin_id: int) -> bool:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                result = await conn.execute(
+                    "UPDATE coupons SET active = $2, updated_at = NOW() WHERE id = $1",
+                    coupon_id,
+                    active,
+                )
+                if result.endswith("1"):
+                    await self._audit(
+                        conn, admin_id, "toggle_coupon", "coupon", coupon_id, {"active": active}
+                    )
+                    return True
+        return False
+
+    async def apply_coupon_to_draft(
+        self, telegram_id: int, draft_id: uuid.UUID, coupon_code: str
+    ) -> asyncpg.Record:
+        normalized_code = coupon_code.strip().upper()
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                draft = await conn.fetchrow(
+                    """
+                    SELECT * FROM checkout_drafts
+                    WHERE id = $1 AND user_id = $2
+                    FOR UPDATE
+                    """,
+                    draft_id,
+                    telegram_id,
+                )
+                if not draft or draft["status"] != "open":
+                    raise StoreError("draft_not_open")
+                coupon = await conn.fetchrow(
+                    "SELECT * FROM coupons WHERE code = $1 FOR UPDATE",
+                    normalized_code,
+                )
+                if (
+                    not coupon
+                    or not coupon["active"]
+                    or coupon["expires_at"] <= datetime.now(timezone.utc)
+                ):
+                    raise StoreError("coupon_unavailable")
+                used = await conn.fetchval(
+                    "SELECT COUNT(*) FROM coupon_redemptions WHERE coupon_id = $1",
+                    coupon["id"],
+                )
+                if used >= coupon["max_uses"]:
+                    raise StoreError("coupon_exhausted")
+                discount = coupon_discount_amount(
+                    money(draft["price"]), coupon, draft["currency"]
+                )
+                await conn.execute(
+                    """
+                    UPDATE checkout_drafts
+                    SET coupon_id = $2, coupon_code = $3, coupon_discount = $4
+                    WHERE id = $1
+                    """,
+                    draft_id,
+                    coupon["id"],
+                    normalized_code,
+                    discount,
+                )
+                return await conn.fetchrow(
+                    """
+                    SELECT d.*, p.name AS product_name
+                    FROM checkout_drafts d JOIN products p ON p.id = d.product_id
+                    WHERE d.id = $1
+                    """,
+                    draft_id,
+                )
+
+    async def remove_coupon_from_draft(self, telegram_id: int, draft_id: uuid.UUID) -> bool:
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                """
+                UPDATE checkout_drafts
+                SET coupon_id = NULL, coupon_code = NULL, coupon_discount = 0
+                WHERE id = $1 AND user_id = $2 AND status = 'open'
+                """,
+                draft_id,
+                telegram_id,
+            )
+        return result.endswith("1")
 
     async def adjust_all_prices(self, currency: str, percent: Decimal, admin_id: int) -> int:
         if currency not in {"DZD", "USD"} or percent <= -100 or percent > 1000:
@@ -309,6 +695,40 @@ class Database:
                 WHERE o.id = $1
                 """,
                 order_id,
+            )
+
+    async def claim_order_notification(self, order_id: int, phase: str) -> bool:
+        if phase not in {"purchase", "approval", "code_delivery"}:
+            raise StoreError("invalid_notification_phase")
+        async with self.pool.acquire() as conn:
+            return bool(
+                await conn.fetchval(
+                    """
+                    INSERT INTO order_notifications (order_id, phase)
+                    VALUES ($1, $2)
+                    ON CONFLICT (order_id, phase) DO NOTHING
+                    RETURNING order_id
+                    """,
+                    order_id,
+                    phase,
+                )
+            )
+
+    async def mark_order_notification(
+        self, order_id: int, phase: str, sent: bool, error: str | None = None
+    ) -> None:
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                """
+                UPDATE order_notifications
+                SET state = $3, sent_at = CASE WHEN $3 = 'sent' THEN NOW() ELSE sent_at END,
+                    error = $4
+                WHERE order_id = $1 AND phase = $2 AND state = 'claimed'
+                """,
+                order_id,
+                phase,
+                "sent" if sent else "failed",
+                (error or "")[:500] or None,
             )
 
     async def admin_subscriptions(self, limit: int = 20) -> list[asyncpg.Record]:
@@ -546,13 +966,34 @@ class Database:
                 product_active = await conn.fetchval("SELECT active FROM products WHERE id = $1", draft["product_id"])
                 if not product_active:
                     raise StoreError("unavailable")
+                subtotal = money(draft["price"])
+                discount = Decimal("0.00")
+                coupon = None
+                if draft["coupon_id"]:
+                    coupon = await conn.fetchrow(
+                        "SELECT * FROM coupons WHERE id = $1 FOR UPDATE",
+                        draft["coupon_id"],
+                    )
+                    if (
+                        not coupon
+                        or not coupon["active"]
+                        or coupon["expires_at"] <= datetime.now(timezone.utc)
+                    ):
+                        raise StoreError("coupon_unavailable")
+                    used = await conn.fetchval(
+                        "SELECT COUNT(*) FROM coupon_redemptions WHERE coupon_id = $1",
+                        coupon["id"],
+                    )
+                    if used >= coupon["max_uses"]:
+                        raise StoreError("coupon_exhausted")
+                    discount = coupon_discount_amount(subtotal, coupon, draft["currency"])
+                price = money(subtotal - discount)
                 wallet = await conn.fetchrow(
                     "SELECT balance FROM wallets WHERE user_id = $1 AND currency = $2 FOR UPDATE",
                     telegram_id,
                     draft["currency"],
                 )
                 balance = money(wallet["balance"] if wallet else 0)
-                price = money(draft["price"])
                 if balance < price:
                     return "insufficient", {"shortage": money(price - balance), "currency": draft["currency"]}
 
@@ -560,8 +1001,9 @@ class Database:
                 order = await conn.fetchrow(
                     """
                     INSERT INTO purchase_orders
-                        (order_code, idempotency_key, user_id, product_id, duration_months, currency, price)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                        (order_code, idempotency_key, user_id, product_id, duration_months, currency,
+                         price, subtotal_price, discount_amount, coupon_id, coupon_code, quantity)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, 1)
                     RETURNING *
                     """,
                     order_code,
@@ -571,28 +1013,46 @@ class Database:
                     draft["duration_months"],
                     draft["currency"],
                     price,
+                    subtotal,
+                    discount,
+                    coupon["id"] if coupon else None,
+                    draft["coupon_code"] if coupon else None,
                 )
-                await conn.execute(
-                    """
-                    UPDATE wallets SET balance = balance - $3, updated_at = NOW()
-                    WHERE user_id = $1 AND currency = $2
-                    """,
-                    telegram_id,
-                    draft["currency"],
-                    price,
-                )
-                await conn.execute(
-                    """
-                    INSERT INTO wallet_ledger (user_id, currency, amount, transaction_type, reference, details)
-                    VALUES ($1, $2, $3, 'purchase', $4, $5::jsonb)
-                    ON CONFLICT (transaction_type, reference, user_id) DO NOTHING
-                    """,
-                    telegram_id,
-                    draft["currency"],
-                    -price,
-                    str(order["id"]),
-                    json.dumps({"order_code": order_code}),
-                )
+                if price > 0:
+                    await conn.execute(
+                        """
+                        UPDATE wallets SET balance = balance - $3, updated_at = NOW()
+                        WHERE user_id = $1 AND currency = $2
+                        """,
+                        telegram_id,
+                        draft["currency"],
+                        price,
+                    )
+                    await conn.execute(
+                        """
+                        INSERT INTO wallet_ledger (user_id, currency, amount, transaction_type, reference, details)
+                        VALUES ($1, $2, $3, 'purchase', $4, $5::jsonb)
+                        ON CONFLICT (transaction_type, reference, user_id) DO NOTHING
+                        """,
+                        telegram_id,
+                        draft["currency"],
+                        -price,
+                        str(order["id"]),
+                        json.dumps({"order_code": order_code}),
+                    )
+                if coupon:
+                    await conn.execute(
+                        """
+                        INSERT INTO coupon_redemptions
+                            (coupon_id, order_id, user_id, original_amount, discount_amount)
+                        VALUES ($1, $2, $3, $4, $5)
+                        """,
+                        coupon["id"],
+                        order["id"],
+                        telegram_id,
+                        subtotal,
+                        discount,
+                    )
                 await conn.execute(
                     "UPDATE checkout_drafts SET status = 'completed', order_id = $2 WHERE id = $1",
                     draft_id,
@@ -684,6 +1144,152 @@ class Database:
                     await self._audit(conn, admin_id, "approve_order", "order", order_id, {})
                 return order
 
+    async def reserve_activation_code(
+        self, order_id: int, admin_id: int, activation_code: str
+    ) -> asyncpg.Record | None:
+        value = activation_code.strip()
+        if not value or len(value) > 2000:
+            raise StoreError("invalid_activation_code")
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                order = await conn.fetchrow(
+                    """
+                    UPDATE purchase_orders
+                    SET status = 'code_preparing', activation_code = $2, updated_at = NOW()
+                    WHERE id = $1 AND status = 'approved_waiting_invite' AND activation_code IS NULL
+                    RETURNING *
+                    """,
+                    order_id,
+                    value,
+                )
+                if not order:
+                    return None
+                await conn.execute(
+                    """
+                    INSERT INTO order_notifications (order_id, phase, state)
+                    VALUES ($1, 'code_delivery', 'claimed')
+                    ON CONFLICT (order_id, phase) DO NOTHING
+                    """,
+                    order_id,
+                )
+                await self._audit(conn, admin_id, "reserve_activation_code", "order", order_id, {})
+                return order
+
+    async def complete_activation_code_delivery(
+        self, order_id: int, admin_id: int
+    ) -> asyncpg.Record | None:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                order = await conn.fetchrow(
+                    """
+                    UPDATE purchase_orders
+                    SET status = 'code_delivered', delivered_at = NOW(), updated_at = NOW()
+                    WHERE id = $1 AND status = 'code_preparing' AND activation_code IS NOT NULL
+                    RETURNING *
+                    """,
+                    order_id,
+                )
+                if not order:
+                    return None
+                await conn.execute(
+                    """
+                    UPDATE order_notifications
+                    SET state = 'sent', sent_at = NOW()
+                    WHERE order_id = $1 AND phase = 'code_delivery' AND state = 'claimed'
+                    """,
+                    order_id,
+                )
+                await self._award_referral_reward(conn, order, admin_id)
+                await self._audit(
+                    conn, admin_id, "complete_activation_code_delivery", "order", order_id, {}
+                )
+                return order
+
+    async def fail_activation_code_delivery(
+        self, order_id: int, admin_id: int, error: str
+    ) -> bool:
+        async with self.pool.acquire() as conn:
+            async with conn.transaction():
+                updated = await conn.fetchval(
+                    """
+                    UPDATE purchase_orders
+                    SET status = 'code_delivery_failed', updated_at = NOW()
+                    WHERE id = $1 AND status = 'code_preparing'
+                    RETURNING id
+                    """,
+                    order_id,
+                )
+                if not updated:
+                    return False
+                await conn.execute(
+                    """
+                    UPDATE order_notifications
+                    SET state = 'failed', error = $2
+                    WHERE order_id = $1 AND phase = 'code_delivery' AND state = 'claimed'
+                    """,
+                    order_id,
+                    error[:500],
+                )
+                await self._audit(
+                    conn, admin_id, "activation_code_delivery_failed", "order", order_id, {}
+                )
+                return True
+
+    async def _award_referral_reward(
+        self, conn: asyncpg.Connection, order: asyncpg.Record, admin_id: int
+    ) -> asyncpg.Record | None:
+        referrer_id = await conn.fetchval(
+            "SELECT referred_by FROM store_users WHERE telegram_id = $1 FOR UPDATE",
+            order["user_id"],
+        )
+        if not referrer_id or referrer_id == order["user_id"]:
+            return None
+        reward_amount = Decimal("30") if order["duration_months"] in {1, 3} else Decimal("50")
+        reward = await conn.fetchrow(
+            """
+            INSERT INTO referral_rewards
+                (referrer_id, referred_user_id, order_id, amount)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (referred_user_id) DO NOTHING
+            RETURNING *
+            """,
+            referrer_id,
+            order["user_id"],
+            order["id"],
+            reward_amount,
+        )
+        if not reward:
+            return None
+        wallet = await conn.fetchrow(
+            "SELECT balance FROM wallets WHERE user_id = $1 AND currency = 'DZD' FOR UPDATE",
+            referrer_id,
+        )
+        if not wallet:
+            raise RuntimeError("Referral recipient DZD wallet is missing.")
+        await conn.execute(
+            "UPDATE wallets SET balance = balance + $2, updated_at = NOW() WHERE user_id = $1 AND currency = 'DZD'",
+            referrer_id,
+            reward_amount,
+        )
+        await conn.execute(
+            """
+            INSERT INTO wallet_ledger
+                (user_id, currency, amount, transaction_type, reference, details)
+            VALUES ($1, 'DZD', $2, 'referral_reward', $3, $4::jsonb)
+            """,
+            referrer_id,
+            reward_amount,
+            str(order["id"]),
+            json.dumps(
+                {
+                    "referred_user_id": order["user_id"],
+                    "order_code": order["order_code"],
+                    "reviewed_by": admin_id,
+                }
+            ),
+        )
+        return reward
+
     async def store_invite(self, order_id: int, admin_id: int, invite_url: str) -> asyncpg.Record | None:
         async with self.pool.acquire() as conn:
             async with conn.transaction():
@@ -747,6 +1353,7 @@ class Database:
                     expires,
                 )
                 if updated:
+                    await self._award_referral_reward(conn, updated, admin_id)
                     await self._audit(conn, admin_id, "confirm_subscription_join", "order", order_id,
                                       {"joined_at": started.isoformat(), "expires_at": expires.isoformat()})
                 return updated
@@ -899,4 +1506,5 @@ class Database:
 
 
 def migration_sql() -> str:
-    return (Path(__file__).parent / "migrations" / "001_initial.sql").read_text(encoding="utf-8")
+    migrations = sorted((Path(__file__).parent / "migrations").glob("[0-9][0-9][0-9]_*.sql"))
+    return "\n\n".join(path.read_text(encoding="utf-8") for path in migrations)
